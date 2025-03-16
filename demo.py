@@ -179,7 +179,7 @@ class MyHost(host.Host):
 
 system = System()
 
-dexed = False
+dexed = True
 
 if dexed:
     e = entry.load('/home/cheery/.clap/Dexed.clap')
@@ -195,10 +195,11 @@ plugin.gui = plugin.get_extension(ext.gui)
 plugin.timer_support = plugin.get_extension(ext.timer_support)
 plugin.audio_ports = plugin.get_extension(ext.audio_ports)
 
-frames_count = 1024
+frames_count = 4096
 
 class AudioBuffer:
     def __init__(self, channel_count, frames_count):
+        self.frames_count = frames_count
         self.channels = []
         for i in range(channel_count):
             self.channels.append((api.c_float*frames_count)())
@@ -230,7 +231,7 @@ evt1 = api.event_note(
 
 @api.hook(api.input_events, 'size')
 def size_hook(_):
-    return 1
+    return 0
 
 @api.hook(api.input_events, 'get')
 def get_hook(_, index):
@@ -248,43 +249,58 @@ def try_push_hook(_, event):
 
 push_push_events = api.output_events(None, try_push_hook)
 
-plugin.activate(44100.0, frames_count, frames_count)
+sample_rate = 44100
+plugin.activate(sample_rate, frames_count, frames_count)
 
 class Process:
     def __init__(self, c):
         self.c = c
 
-def audio_loop():
-    plugin.start_processing()
+c_inputs = (api.audio_buffer*len(input_buffers))(
+    *(b.c for b in input_buffers))
+c_outputs = (api.audio_buffer*len(output_buffers))(
+    *(b.c for b in output_buffers))
+process = api.process(
+    steady_time = -1,
+    frames_count = frames_count,
+    transport = None,
+    audio_inputs = c_inputs,
+    audio_inputs_count = len(input_buffers),
+    audio_outputs = c_outputs,
+    audio_outputs_count = len(output_buffers),
+    in_events = pointer(blank_events),
+    out_events = pointer(push_push_events),
+)
+process = Process(process)
 
-    c_inputs = (api.audio_buffer*len(input_buffers))(
-        *(b.c for b in input_buffers))
-    c_outputs = (api.audio_buffer*len(output_buffers))(
-        *(b.c for b in output_buffers))
-    process = api.process(
-        steady_time = -1,
-        frames_count = frames_count,
-        transport = None,
-        audio_inputs = c_inputs,
-        audio_inputs_count = len(input_buffers),
-        audio_outputs = c_outputs,
-        audio_outputs_count = len(output_buffers),
-        in_events = pointer(blank_events),
-        out_events = pointer(push_push_events),
-    )
-    process = Process(process)
-    while system.running:
+system.audio_runlock = threading.Lock()
+system.audio_processing = False
+
+def audio_callback():
+    if not system.running and system.audio_processing:
+        plugin.stop_processing()
+        system.audio_processing = False
+        system.audio_runlock.release()
+    elif not system.audio_processing:
+        plugin.start_processing()
+        system.audio_processing = True
+        system.audio_runlock.acquire()
+    else:
         resp = plugin.process(process)
         if resp != api.PROCESS_CONTINUE:
             system.running = False
-            print('bad response:', resp)
-        else:
-            time.sleep(0.010)
-    plugin.stop_processing()
+            system.audio_processing = False
+            plugin.stop_processing()
+            print('audio error: bad response:', resp)
+system.audio_callback = audio_callback
+
+import device.sdl2
 
 system.running = True
-audio = threading.Thread(target=audio_loop)
-audio.start()
+audio_device = device.sdl2.Device(system, output_buffers[0], sample_rate)
+
+#audio = threading.Thread(target=audio_loop)
+#audio.start()
 
 assert plugin.gui.is_api_supported(b'x11', False)
 plugin.gui.create(b'x11', False)
@@ -299,8 +315,9 @@ window.loop()
 plugin.gui.destroy()
 
 print(plugin.host.requested_extensions - set(plugin.host.available_extensions))
-audio.join()
 
+with system.audio_runlock:
+    audio_device.close()
 plugin.deactivate()
 plugin.destroy()
 e.deinit()
